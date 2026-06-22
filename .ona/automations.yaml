@@ -1,0 +1,30 @@
+tasks:
+  installDeps:
+    name: Install dependencies
+    description: Install the Python package and Ona SDK dependency.
+    command: |
+      python -m pip install -e .
+    triggeredBy:
+      - manual
+      - postDevcontainerStart
+      - prebuild
+
+  test:
+    name: Run tests
+    description: Run the Python unit test suite.
+    command: |
+      python -m unittest discover -s tests
+    triggeredBy:
+      - manual
+    dependsOn:
+      - installDeps
+
+  watchAuditLogs:
+    name: Watch audit logs
+    description: Poll Ona audit logs and log received entries to stdout.
+    command: |
+      ona-auditlog
+    triggeredBy:
+      - manual
+    dependsOn:
+      - installDeps
