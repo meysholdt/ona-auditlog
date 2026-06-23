@@ -34,11 +34,12 @@ ona-auditlog
 ```
 
 By default, the first request includes the last 60 minutes of audit log history
-so stdout and the log files have initial content. Change or disable that
-lookback with:
+and scans up to 3 pages so stdout and the log files have initial content.
+Change or disable that lookback with:
 
 ```bash
 ona-auditlog --history-minutes 15
+ona-auditlog --history-pages 5
 ona-auditlog --history-minutes 0
 ```
 
@@ -100,9 +101,9 @@ Stdout only receives these events:
 For each matching event, stdout includes all values from the relevant audit log
 entry plus a clearly separated `enrichment` object containing:
 
-- user email
+- creator email
 - git repository URL
-- S3 streamstore prefix for the agent conversation, when it can be computed
+- S3 streamstore prefix for the agent conversation, only for agent execution events
 
 ```json
 {
@@ -116,9 +117,8 @@ entry plus a clearly separated `enrichment` object containing:
     "subjectType": "RESOURCE_TYPE_ENVIRONMENT"
   },
   "enrichment": {
-    "agentConversationS3Url": null,
-    "gitRepoUrl": "https://github.com/example/repo.git",
-    "userEmail": "user@example.com"
+    "creatorEmail": "user@example.com",
+    "gitRepoUrl": "https://github.com/example/repo.git"
   }
 }
 ```

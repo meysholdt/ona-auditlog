@@ -16,18 +16,17 @@ DEFAULT_HOST = "app.gitpod.io"
 DEFAULT_LOG_FILE = "auditlog.log"
 DEFAULT_ENRICHMENT_DETAIL_FILE = "enrichment-detail.log"
 DEFAULT_HISTORY_MINUTES = 60.0
+DEFAULT_HISTORY_PAGES = 3
 
-ENVIRONMENT_EVENTS = {
-    ("RESOURCE_TYPE_ENVIRONMENT", "Environment created"): "environment.created",
-    ("RESOURCE_TYPE_ENVIRONMENT", "Environment deleted"): "environment.deleted",
-    ("RESOURCE_TYPE_ENVIRONMENT", "marked for deletion"): "environment.deleted",
-    ("RESOURCE_TYPE_ENVIRONMENT", "force deleted environment"): "environment.deleted",
-    ("RESOURCE_TYPE_ENVIRONMENT", "started environment"): "environment.started",
-    ("RESOURCE_TYPE_ENVIRONMENT", "stopped environment"): "environment.stopped",
-}
-AGENT_EXECUTION_EVENTS = {
-    ("RESOURCE_TYPE_AGENT_EXECUTION", "AgentExecution created"): "agent_execution.started",
-}
+ENVIRONMENT_ACTION_PREFIXES = (
+    ("Environment created", "environment.created"),
+    ("Environment deleted", "environment.deleted"),
+    ("marked for deletion", "environment.deleted"),
+    ("force deleted environment", "environment.deleted"),
+    ("started environment", "environment.started"),
+    ("stopped environment", "environment.stopped"),
+)
+AGENT_EXECUTION_ACTION_PREFIXES = (("AgentExecution created", "agent_execution.started"),)
 
 
 def build_base_url(host: str) -> str:
@@ -92,6 +91,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "When --from is not set, fetch this many minutes of recent audit log history. "
             f"Defaults to {DEFAULT_HISTORY_MINUTES:g}. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--history-pages",
+        type=int,
+        default=DEFAULT_HISTORY_PAGES,
+        help=(
+            "Number of audit log pages to scan on the first fetch when history is enabled. "
+            f"Defaults to {DEFAULT_HISTORY_PAGES}."
         ),
     )
     parser.add_argument(
@@ -186,11 +194,16 @@ def attr(value: Any, name: str) -> Any:
 
 
 def relevant_event_kind(entry: Any) -> str | None:
-    key = (attr(entry, "subject_type"), attr(entry, "action"))
-    if key in ENVIRONMENT_EVENTS:
-        return ENVIRONMENT_EVENTS[key]
-    if key in AGENT_EXECUTION_EVENTS:
-        return AGENT_EXECUTION_EVENTS[key]
+    subject_type = attr(entry, "subject_type")
+    action = attr(entry, "action") or ""
+    if subject_type == "RESOURCE_TYPE_ENVIRONMENT":
+        for prefix, kind in ENVIRONMENT_ACTION_PREFIXES:
+            if action.startswith(prefix):
+                return kind
+    if subject_type == "RESOURCE_TYPE_AGENT_EXECUTION":
+        for prefix, kind in AGENT_EXECUTION_ACTION_PREFIXES:
+            if action.startswith(prefix):
+                return kind
     return None
 
 
@@ -352,35 +365,66 @@ def creator_user_id(resource: dict[str, Any] | None) -> str | None:
     return creator.get("id")
 
 
-def set_user_if_missing(client: Gitpod, record: dict[str, Any], user_id: str | None) -> None:
+def set_user_if_missing(
+    client: Gitpod,
+    record: dict[str, Any],
+    user_id: str | None,
+    user_cache: dict[str, dict[str, Any] | None] | None = None,
+) -> None:
     if record.get("user") is not None or not user_id:
         return
 
     try:
-        user = user_enrichment(client, user_id)
+        fetched = False
+        if user_cache is not None and user_id in user_cache:
+            user = user_cache[user_id]
+        else:
+            user = user_enrichment(client, user_id)
+            fetched = True
+            if user_cache is not None:
+                user_cache[user_id] = user
         record["user"] = user
-        write_detail(record["details"], "user", user)
+        if fetched:
+            write_detail(record["details"], "user", user)
     except Exception as exc:
         record["errors"].append(f"failed to fetch creator user {user_id}: {exc}")
 
 
-def set_runner_if_missing(client: Gitpod, record: dict[str, Any], runner_id: str | None) -> None:
+def set_runner_if_missing(
+    client: Gitpod,
+    record: dict[str, Any],
+    runner_id: str | None,
+    runner_cache: dict[str, dict[str, Any] | None] | None = None,
+) -> None:
     if record.get("runner") is not None or not runner_id:
         return
 
     try:
-        runner = runner_enrichment(client, runner_id)
+        fetched = False
+        if runner_cache is not None and runner_id in runner_cache:
+            runner = runner_cache[runner_id]
+        else:
+            runner = runner_enrichment(client, runner_id)
+            fetched = True
+            if runner_cache is not None:
+                runner_cache[runner_id] = runner
         record["runner"] = runner
-        write_detail(record["details"], "runner", runner)
+        if fetched:
+            write_detail(record["details"], "runner", runner)
     except Exception as exc:
         record["errors"].append(f"failed to fetch runner {runner_id}: {exc}")
 
 
-def enrich_entry(client: Gitpod, entry: Any, kind: str) -> dict[str, Any]:
+def enrich_entry(
+    client: Gitpod,
+    entry: Any,
+    kind: str,
+    environment_cache: dict[str, dict[str, Any] | None] | None = None,
+    user_cache: dict[str, dict[str, Any] | None] | None = None,
+    runner_cache: dict[str, dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     subject_id = attr(entry, "subject_id")
     subject_type = attr(entry, "subject_type")
-    actor_id = attr(entry, "actor_id")
-    actor_principal = attr(entry, "actor_principal")
     record: dict[str, Any] = {
         "event": kind,
         "auditLog": to_payload(entry),
@@ -392,21 +436,21 @@ def enrich_entry(client: Gitpod, entry: Any, kind: str) -> dict[str, Any]:
         "errors": [],
     }
 
-    if actor_principal == "PRINCIPAL_USER":
-        try:
-            user = user_enrichment(client, actor_id)
-            record["user"] = user
-            write_detail(record["details"], "user", user)
-        except Exception as exc:
-            record["errors"].append(f"failed to fetch actor user {actor_id}: {exc}")
-
     if subject_type == "RESOURCE_TYPE_ENVIRONMENT":
         try:
-            environment = environment_enrichment(client, subject_id)
+            fetched = False
+            if environment_cache is not None and subject_id in environment_cache:
+                environment = environment_cache[subject_id]
+            else:
+                environment = environment_enrichment(client, subject_id)
+                fetched = True
+                if environment_cache is not None:
+                    environment_cache[subject_id] = environment
             record["environment"] = environment
-            write_detail(record["details"], "environment", environment)
-            set_user_if_missing(client, record, creator_user_id(environment))
-            set_runner_if_missing(client, record, runner_id_from_environment(environment))
+            if fetched:
+                write_detail(record["details"], "environment", environment)
+            set_user_if_missing(client, record, creator_user_id(environment), user_cache)
+            set_runner_if_missing(client, record, runner_id_from_environment(environment), runner_cache)
         except Exception as exc:
             record["errors"].append(f"failed to fetch environment {subject_id}: {exc}")
 
@@ -415,7 +459,7 @@ def enrich_entry(client: Gitpod, entry: Any, kind: str) -> dict[str, Any]:
             agent_execution = agent_execution_enrichment(client, subject_id)
             record["agentExecution"] = agent_execution
             write_detail(record["details"], "agentExecution", agent_execution)
-            set_user_if_missing(client, record, creator_user_id(agent_execution))
+            set_user_if_missing(client, record, creator_user_id(agent_execution), user_cache)
         except Exception as exc:
             agent_execution = None
             record["errors"].append(f"failed to fetch agent execution {subject_id}: {exc}")
@@ -423,10 +467,18 @@ def enrich_entry(client: Gitpod, entry: Any, kind: str) -> dict[str, Any]:
         environments = []
         for environment_id in environment_ids_from_agent_execution(agent_execution):
             try:
-                environment = environment_enrichment(client, environment_id)
+                fetched = False
+                if environment_cache is not None and environment_id in environment_cache:
+                    environment = environment_cache[environment_id]
+                else:
+                    environment = environment_enrichment(client, environment_id)
+                    fetched = True
+                    if environment_cache is not None:
+                        environment_cache[environment_id] = environment
                 environments.append(environment)
-                write_detail(record["details"], "environment", environment)
-                set_runner_if_missing(client, record, runner_id_from_environment(environment))
+                if fetched:
+                    write_detail(record["details"], "environment", environment)
+                set_runner_if_missing(client, record, runner_id_from_environment(environment), runner_cache)
             except Exception as exc:
                 record["errors"].append(f"failed to fetch agent execution environment {environment_id}: {exc}")
         if environments:
@@ -440,11 +492,17 @@ def enrich_entry(client: Gitpod, entry: Any, kind: str) -> dict[str, Any]:
 
 def enrichment_projection(enriched: dict[str, Any]) -> dict[str, Any]:
     agent_execution = enriched.get("agentExecution")
-    return {
-        "userEmail": (enriched.get("user") or {}).get("email"),
-        "gitRepoUrl": git_repo_url(enriched.get("environment")),
-        "agentConversationS3Url": conversation_s3_url(agent_execution, enriched.get("runner")),
+    environment = enriched.get("environment")
+    if not environment and enriched.get("environments"):
+        environment = enriched["environments"][0]
+
+    projection = {
+        "creatorEmail": (enriched.get("user") or {}).get("email"),
+        "gitRepoUrl": git_repo_url(environment),
     }
+    if enriched.get("event") == "agent_execution.started":
+        projection["agentConversationS3Url"] = conversation_s3_url(agent_execution, enriched.get("runner"))
+    return projection
 
 
 def stdout_record(enriched: dict[str, Any]) -> dict[str, Any]:
@@ -492,6 +550,8 @@ def audit_log_filter(args: argparse.Namespace, now: datetime | None = None) -> d
 def audit_log_list_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     if args.page_size < 1:
         raise ValueError("--page-size must be greater than zero")
+    if args.history_pages < 1:
+        raise ValueError("--history-pages must be greater than zero")
 
     kwargs: dict[str, Any] = {
         "page_size": args.page_size,
@@ -503,25 +563,75 @@ def audit_log_list_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return kwargs
 
 
+def page_next_token(page: Any) -> str | None:
+    pagination = attr(page, "pagination")
+    return attr(pagination, "next_token") or attr(pagination, "nextToken")
+
+
+def list_audit_log_pages(client: Gitpod, list_kwargs: dict[str, Any], page_count: int) -> list[list[Any]]:
+    pages: list[list[Any]] = []
+    token: str | None = None
+
+    for _ in range(page_count):
+        kwargs = dict(list_kwargs)
+        if token:
+            kwargs["token"] = token
+
+        page = client.events.list(**kwargs)
+        pages.append(list(page.entries))
+        token = page_next_token(page)
+        if not token:
+            break
+
+    return pages
+
+
+def cache_environment_for_entry(
+    client: Gitpod,
+    entry: Any,
+    environment_cache: dict[str, dict[str, Any] | None],
+    details: list[dict[str, Any]],
+) -> None:
+    if attr(entry, "subject_type") != "RESOURCE_TYPE_ENVIRONMENT":
+        return
+
+    environment_id = attr(entry, "subject_id")
+    if not environment_id or environment_id in environment_cache:
+        return
+
+    try:
+        environment = environment_enrichment(client, environment_id)
+        environment_cache[environment_id] = environment
+        write_detail(details, "environment", environment)
+    except Exception:
+        environment_cache[environment_id] = None
+
+
 def poll_audit_logs(args: argparse.Namespace) -> None:
     base_url = args.base_url.rstrip("/") if args.base_url else build_base_url(args.host)
     client = Gitpod(bearer_token=args.api_key, base_url=base_url)
     list_kwargs = audit_log_list_kwargs(args)
     seen_ids: set[str] = set()
+    environment_cache: dict[str, dict[str, Any] | None] = {}
+    user_cache: dict[str, dict[str, Any] | None] = {}
+    runner_cache: dict[str, dict[str, Any] | None] = {}
     log_file = Path(args.log_file)
     enrichment_detail_file = Path(args.enrichment_detail_file)
+    first_fetch = True
 
     while True:
-        page = client.events.list(**list_kwargs)
-        entries = list(page.entries)
+        history_enabled = not args.from_time and args.history_minutes > 0
+        page_count = args.history_pages if first_fetch and history_enabled else 1
+        pages = list_audit_log_pages(client, list_kwargs, page_count)
         new_entries = []
 
-        for entry in entries:
-            entry_id = getattr(entry, "id", None)
-            if entry_id is None or entry_id not in seen_ids:
-                new_entries.append(entry)
-            if entry_id is not None:
-                seen_ids.add(entry_id)
+        for entries in pages:
+            for entry in entries:
+                entry_id = getattr(entry, "id", None)
+                if entry_id is None or entry_id not in seen_ids:
+                    new_entries.append(entry)
+                if entry_id is not None:
+                    seen_ids.add(entry_id)
 
         with log_file.open("a", encoding="utf-8") as raw_log, enrichment_detail_file.open(
             "a", encoding="utf-8"
@@ -529,15 +639,22 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
             for entry in reversed(new_entries):
                 raw_log.write(f"{compact_json(entry)}\n")
 
+                cache_details: list[dict[str, Any]] = []
+                cache_environment_for_entry(client, entry, environment_cache, cache_details)
+                for detail in cache_details:
+                    append_formatted_json(detail_log, detail)
+
                 kind = relevant_event_kind(entry)
                 if kind is None:
                     continue
 
-                enriched = enrich_entry(client, entry, kind)
+                enriched = enrich_entry(client, entry, kind, environment_cache, user_cache, runner_cache)
                 for detail in enriched.pop("details"):
                     append_formatted_json(detail_log, detail)
 
                 print(formatted_json(stdout_record(enriched)), flush=True)
+
+        first_fetch = False
 
         if args.once:
             return

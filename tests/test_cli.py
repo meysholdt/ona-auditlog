@@ -46,11 +46,22 @@ def audit_entry(
 
 
 class FakeEvents:
-    def __init__(self, entries: list[SimpleNamespace]) -> None:
+    def __init__(self, entries: list[SimpleNamespace], pages: list[list[SimpleNamespace]] | None = None) -> None:
         self._entries = entries
+        self._pages = pages
+        self.calls = []
 
-    def list(self, **_kwargs):
-        return SimpleNamespace(entries=self._entries)
+    def list(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._pages is None:
+            return SimpleNamespace(entries=self._entries, pagination=SimpleNamespace(next_token=None))
+
+        if "token" in kwargs:
+            index = int(kwargs["token"])
+        else:
+            index = 0
+        next_token = str(index + 1) if index + 1 < len(self._pages) else None
+        return SimpleNamespace(entries=self._pages[index], pagination=SimpleNamespace(next_token=next_token))
 
 
 class FakeUsers:
@@ -112,12 +123,29 @@ class FakeRunners:
 
 
 class FakeClient:
-    def __init__(self, entries: list[SimpleNamespace] | None = None, **_kwargs) -> None:
-        self.events = FakeEvents(entries or [])
+    def __init__(
+        self,
+        entries: list[SimpleNamespace] | None = None,
+        *,
+        pages: list[list[SimpleNamespace]] | None = None,
+        **_kwargs,
+    ) -> None:
+        self.events = FakeEvents(entries or [], pages=pages)
         self.users = FakeUsers()
         self.environments = FakeEnvironments()
         self.agents = FakeAgents()
         self.runners = FakeRunners()
+
+
+class FailingEnvironments:
+    def retrieve(self, *, environment_id: str):
+        raise RuntimeError(f"environment {environment_id} is gone")
+
+
+class FakeClientWithDeletedEnvironment(FakeClient):
+    def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
+        super().__init__(entries, **kwargs)
+        self.environments = FailingEnvironments()
 
 
 def parse_json_stream(content: str) -> list[dict]:
@@ -149,7 +177,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload, {"resource_type": "RESOURCE_TYPE_ENVIRONMENT", "resource_id": "env-1"})
 
     def test_relevant_event_kind_filters_requested_stdout_events(self) -> None:
-        self.assertEqual(relevant_event_kind(audit_entry(action="Environment created")), "environment.created")
+        self.assertEqual(
+            relevant_event_kind(audit_entry(action="Environment created (identity from cookie:account/user-1)")),
+            "environment.created",
+        )
         self.assertEqual(relevant_event_kind(audit_entry(action="Environment deleted")), "environment.deleted")
         self.assertEqual(relevant_event_kind(audit_entry(action="started environment")), "environment.started")
         self.assertEqual(relevant_event_kind(audit_entry(action="stopped environment")), "environment.stopped")
@@ -211,9 +242,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             enrichment_projection(enriched),
             {
-                "userEmail": "user@example.com",
+                "creatorEmail": "user@example.com",
                 "gitRepoUrl": "https://github.com/acme/example.git",
-                "agentConversationS3Url": None,
             },
         )
 
@@ -224,8 +254,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(record["auditLog"]["id"], "audit-9")
         self.assertEqual(record["auditLog"]["action"], "Environment created")
-        self.assertEqual(record["enrichment"]["userEmail"], "user@example.com")
+        self.assertEqual(record["enrichment"]["creatorEmail"], "user@example.com")
         self.assertEqual(record["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertNotIn("agentConversationS3Url", record["enrichment"])
 
     def test_conversation_s3_url_computes_streamstore_prefix_from_runner_bucket(self) -> None:
         self.assertEqual(
@@ -248,6 +279,7 @@ class CliTests(unittest.TestCase):
             page_size=100,
             once=True,
             history_minutes=60,
+            history_pages=1,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -279,12 +311,74 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(stdout_lines), 1)
         self.assertEqual(stdout_lines[0]["auditLog"]["id"], "audit-2")
         self.assertEqual(stdout_lines[0]["auditLog"]["action"], "Environment created")
-        self.assertEqual(stdout_lines[0]["enrichment"]["userEmail"], "user@example.com")
+        self.assertEqual(stdout_lines[0]["enrichment"]["creatorEmail"], "user@example.com")
         self.assertEqual(stdout_lines[0]["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertNotIn("agentConversationS3Url", stdout_lines[0]["enrichment"])
         self.assertNotIn("event", stdout_lines[0])
-        self.assertEqual([line["kind"] for line in detail_lines], ["user", "environment", "runner"])
+        self.assertEqual([line["kind"] for line in detail_lines], ["environment", "user", "runner"])
         self.assertIn("\n  ", stdout.getvalue())
         self.assertIn("\n  ", detail_content)
+
+    def test_poll_audit_logs_scans_startup_history_pages(self) -> None:
+        page_one = [audit_entry(id="audit-2", action="created environment logs token")]
+        page_two = [
+            audit_entry(
+                id="audit-1",
+                action="Environment created (identity from cookie:account/user-1)",
+            )
+        ]
+        args = argparse.Namespace(
+            host="app.gitpod.io",
+            base_url=None,
+            api_key=None,
+            page_size=100,
+            once=True,
+            history_minutes=60,
+            history_pages=2,
+            from_time=None,
+            to_time=None,
+            actor_id=[],
+            actor_principal=[],
+            subject_id=[],
+            subject_type=[],
+            log_file="",
+            enrichment_detail_file="",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args.log_file = f"{tmp}/auditlog.log"
+            args.enrichment_detail_file = f"{tmp}/enrichment-detail.log"
+            stdout = io.StringIO()
+            with patch("ona_auditlog.cli.Gitpod", lambda **kwargs: FakeClient(pages=[page_one, page_two], **kwargs)):
+                with redirect_stdout(stdout):
+                    poll_audit_logs(args)
+
+            stdout_lines = parse_json_stream(stdout.getvalue())
+
+        self.assertEqual(len(stdout_lines), 1)
+        self.assertEqual(stdout_lines[0]["auditLog"]["id"], "audit-1")
+
+    def test_enrich_entry_can_use_cached_environment_for_deleted_event(self) -> None:
+        cached_environment = {
+            "id": "env-1",
+            "metadata": {
+                "runnerId": "runner-1",
+                "creator": {"id": "user-1", "principal": "PRINCIPAL_USER"},
+            },
+            "status": {"content": {"git": {"cloneUrl": "https://github.com/acme/cached.git"}}},
+        }
+        enriched = enrich_entry(
+            FakeClientWithDeletedEnvironment(),
+            audit_entry(action="Environment deleted"),
+            "environment.deleted",
+            environment_cache={"env-1": cached_environment},
+        )
+
+        record = stdout_record(enriched)
+
+        self.assertEqual(record["enrichment"]["creatorEmail"], "user@example.com")
+        self.assertEqual(record["enrichment"]["gitRepoUrl"], "https://github.com/acme/cached.git")
+        self.assertNotIn("agentConversationS3Url", record["enrichment"])
 
     def test_recent_from_time_formats_utc_timestamp(self) -> None:
         self.assertEqual(
@@ -299,6 +393,7 @@ class CliTests(unittest.TestCase):
     def test_audit_log_filter_defaults_to_recent_history(self) -> None:
         args = argparse.Namespace(
             history_minutes=60,
+            history_pages=3,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -314,6 +409,7 @@ class CliTests(unittest.TestCase):
     def test_audit_log_filter_can_disable_default_history(self) -> None:
         args = argparse.Namespace(
             history_minutes=0,
+            history_pages=3,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -326,6 +422,7 @@ class CliTests(unittest.TestCase):
     def test_audit_log_filter_supports_sdk_filter_fields(self) -> None:
         args = argparse.Namespace(
             history_minutes=60,
+            history_pages=3,
             from_time="2026-01-01T00:00:00Z",
             to_time=None,
             actor_id=["user-1"],
@@ -348,6 +445,7 @@ class CliTests(unittest.TestCase):
         args = argparse.Namespace(
             page_size=50,
             history_minutes=0,
+            history_pages=3,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -367,6 +465,7 @@ class CliTests(unittest.TestCase):
         args = argparse.Namespace(
             page_size=0,
             history_minutes=0,
+            history_pages=3,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -375,6 +474,21 @@ class CliTests(unittest.TestCase):
             subject_type=[],
         )
         with self.assertRaisesRegex(ValueError, "--page-size"):
+            audit_log_list_kwargs(args)
+
+    def test_audit_log_list_kwargs_rejects_invalid_history_pages(self) -> None:
+        args = argparse.Namespace(
+            page_size=100,
+            history_minutes=0,
+            history_pages=0,
+            from_time=None,
+            to_time=None,
+            actor_id=[],
+            actor_principal=[],
+            subject_id=[],
+            subject_type=[],
+        )
+        with self.assertRaisesRegex(ValueError, "--history-pages"):
             audit_log_list_kwargs(args)
 
 
