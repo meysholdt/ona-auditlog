@@ -239,6 +239,22 @@ def runner_enrichment(client: Gitpod, runner_id: str | None) -> dict[str, Any] |
     return to_payload(response.runner)
 
 
+def workflow_execution_action_enrichment(client: Gitpod, workflow_execution_action_id: str | None) -> dict[str, Any] | None:
+    if not workflow_execution_action_id:
+        return None
+
+    response = client.automations.retrieve_execution_action(workflow_execution_action_id=workflow_execution_action_id)
+    return to_payload(response.workflow_execution_action)
+
+
+def workflow_execution_enrichment(client: Gitpod, workflow_execution_id: str | None) -> dict[str, Any] | None:
+    if not workflow_execution_id:
+        return None
+
+    response = client.automations.retrieve_execution(workflow_execution_id=workflow_execution_id)
+    return to_payload(response.workflow_execution)
+
+
 def write_detail(details: list[dict[str, Any]], kind: str, detail: dict[str, Any] | None) -> None:
     if detail is None:
         return
@@ -365,6 +381,71 @@ def creator_user_id(resource: dict[str, Any] | None) -> str | None:
     return creator.get("id")
 
 
+def workflow_action_id(resource: dict[str, Any] | None) -> str | None:
+    if not resource:
+        return None
+
+    metadata = resource.get("metadata") or {}
+    action_id = metadata.get("workflowActionId") or metadata.get("workflow_action_id")
+    if action_id:
+        return action_id
+
+    spec = resource.get("spec") or {}
+    return spec.get("workflowActionId") or spec.get("workflow_action_id")
+
+
+def workflow_execution_id(action: dict[str, Any] | None) -> str | None:
+    if not action:
+        return None
+
+    metadata = action.get("metadata") or {}
+    return metadata.get("workflowExecutionId") or metadata.get("workflow_execution_id")
+
+
+def resolve_creator_user_id(
+    client: Gitpod,
+    resource: dict[str, Any] | None,
+    details: list[dict[str, Any]],
+    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
+    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
+) -> str | None:
+    direct_user_id = creator_user_id(resource)
+    if direct_user_id:
+        return direct_user_id
+
+    action_id = workflow_action_id(resource)
+    if not action_id:
+        return None
+
+    if workflow_action_cache is not None and action_id in workflow_action_cache:
+        action = workflow_action_cache[action_id]
+    else:
+        try:
+            action = workflow_execution_action_enrichment(client, action_id)
+        except Exception:
+            return None
+        if workflow_action_cache is not None:
+            workflow_action_cache[action_id] = action
+        write_detail(details, "workflowExecutionAction", action)
+
+    execution_id = workflow_execution_id(action)
+    if not execution_id:
+        return None
+
+    if workflow_execution_cache is not None and execution_id in workflow_execution_cache:
+        execution = workflow_execution_cache[execution_id]
+    else:
+        try:
+            execution = workflow_execution_enrichment(client, execution_id)
+        except Exception:
+            return None
+        if workflow_execution_cache is not None:
+            workflow_execution_cache[execution_id] = execution
+        write_detail(details, "workflowExecution", execution)
+
+    return creator_user_id(execution)
+
+
 def set_user_if_missing(
     client: Gitpod,
     record: dict[str, Any],
@@ -422,6 +503,8 @@ def enrich_entry(
     environment_cache: dict[str, dict[str, Any] | None] | None = None,
     user_cache: dict[str, dict[str, Any] | None] | None = None,
     runner_cache: dict[str, dict[str, Any] | None] | None = None,
+    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
+    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     subject_id = attr(entry, "subject_id")
     subject_type = attr(entry, "subject_type")
@@ -449,7 +532,14 @@ def enrich_entry(
             record["environment"] = environment
             if fetched:
                 write_detail(record["details"], "environment", environment)
-            set_user_if_missing(client, record, creator_user_id(environment), user_cache)
+            creator_id = resolve_creator_user_id(
+                client,
+                environment,
+                record["details"],
+                workflow_action_cache,
+                workflow_execution_cache,
+            )
+            set_user_if_missing(client, record, creator_id, user_cache)
             set_runner_if_missing(client, record, runner_id_from_environment(environment), runner_cache)
         except Exception as exc:
             record["errors"].append(f"failed to fetch environment {subject_id}: {exc}")
@@ -459,7 +549,14 @@ def enrich_entry(
             agent_execution = agent_execution_enrichment(client, subject_id)
             record["agentExecution"] = agent_execution
             write_detail(record["details"], "agentExecution", agent_execution)
-            set_user_if_missing(client, record, creator_user_id(agent_execution), user_cache)
+            creator_id = resolve_creator_user_id(
+                client,
+                agent_execution,
+                record["details"],
+                workflow_action_cache,
+                workflow_execution_cache,
+            )
+            set_user_if_missing(client, record, creator_id, user_cache)
         except Exception as exc:
             agent_execution = None
             record["errors"].append(f"failed to fetch agent execution {subject_id}: {exc}")
@@ -615,6 +712,8 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
     environment_cache: dict[str, dict[str, Any] | None] = {}
     user_cache: dict[str, dict[str, Any] | None] = {}
     runner_cache: dict[str, dict[str, Any] | None] = {}
+    workflow_action_cache: dict[str, dict[str, Any] | None] = {}
+    workflow_execution_cache: dict[str, dict[str, Any] | None] = {}
     log_file = Path(args.log_file)
     enrichment_detail_file = Path(args.enrichment_detail_file)
     first_fetch = True
@@ -648,7 +747,16 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
                 if kind is None:
                     continue
 
-                enriched = enrich_entry(client, entry, kind, environment_cache, user_cache, runner_cache)
+                enriched = enrich_entry(
+                    client,
+                    entry,
+                    kind,
+                    environment_cache,
+                    user_cache,
+                    runner_cache,
+                    workflow_action_cache,
+                    workflow_execution_cache,
+                )
                 for detail in enriched.pop("details"):
                     append_formatted_json(detail_log, detail)
 

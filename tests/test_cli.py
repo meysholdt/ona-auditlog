@@ -89,6 +89,27 @@ class FakeEnvironments:
         )
 
 
+class FakeWorkflowEnvironments:
+    def retrieve(self, *, environment_id: str):
+        return SimpleNamespace(
+            environment=SimpleNamespace(
+                id=environment_id,
+                metadata=SimpleNamespace(
+                    name="Workflow Env",
+                    runner_id="runner-1",
+                    creator=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
+                ),
+                spec=SimpleNamespace(workflow_action_id="workflow-action-1"),
+                status=SimpleNamespace(
+                    phase="ENVIRONMENT_PHASE_RUNNING",
+                    content=SimpleNamespace(
+                        git=SimpleNamespace(clone_url="https://github.com/acme/workflow.git"),
+                    ),
+                ),
+            )
+        )
+
+
 class FakeAgents:
     def retrieve_execution(self, *, agent_execution_id: str):
         return SimpleNamespace(
@@ -102,6 +123,26 @@ class FakeAgents:
                 status=SimpleNamespace(
                     phase="PHASE_RUNNING",
                     used_environments=[SimpleNamespace(environment_id="env-2")],
+                    conversation_url="https://runner.example/agent-exec-1/conversation",
+                ),
+            )
+        )
+
+
+class FakeWorkflowAgents:
+    def retrieve_execution(self, *, agent_execution_id: str):
+        return SimpleNamespace(
+            agent_execution=SimpleNamespace(
+                id=agent_execution_id,
+                metadata=SimpleNamespace(
+                    name="Workflow Agent Execution",
+                    creator=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
+                    workflow_action_id="workflow-action-1",
+                ),
+                spec=SimpleNamespace(code_context=SimpleNamespace(environment_id="env-1")),
+                status=SimpleNamespace(
+                    phase="PHASE_RUNNING",
+                    used_environments=[SimpleNamespace(environment_id="env-1")],
                     conversation_url="https://runner.example/agent-exec-1/conversation",
                 ),
             )
@@ -122,6 +163,27 @@ class FakeRunners:
         )
 
 
+class FakeAutomations:
+    def retrieve_execution_action(self, *, workflow_execution_action_id: str):
+        return SimpleNamespace(
+            workflow_execution_action=SimpleNamespace(
+                id=workflow_execution_action_id,
+                metadata=SimpleNamespace(workflow_execution_id="workflow-execution-1"),
+            )
+        )
+
+    def retrieve_execution(self, *, workflow_execution_id: str):
+        return SimpleNamespace(
+            workflow_execution=SimpleNamespace(
+                id=workflow_execution_id,
+                metadata=SimpleNamespace(
+                    creator=SimpleNamespace(id="user-1", principal="PRINCIPAL_USER"),
+                    executor=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
+                ),
+            )
+        )
+
+
 class FakeClient:
     def __init__(
         self,
@@ -135,6 +197,7 @@ class FakeClient:
         self.environments = FakeEnvironments()
         self.agents = FakeAgents()
         self.runners = FakeRunners()
+        self.automations = FakeAutomations()
 
 
 class FailingEnvironments:
@@ -146,6 +209,18 @@ class FakeClientWithDeletedEnvironment(FakeClient):
     def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
         super().__init__(entries, **kwargs)
         self.environments = FailingEnvironments()
+
+
+class FakeClientWithWorkflowEnvironment(FakeClient):
+    def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
+        super().__init__(entries, **kwargs)
+        self.environments = FakeWorkflowEnvironments()
+
+
+class FakeClientWithWorkflowAgent(FakeClient):
+    def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
+        super().__init__(entries, **kwargs)
+        self.agents = FakeWorkflowAgents()
 
 
 def parse_json_stream(content: str) -> list[dict]:
@@ -219,6 +294,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(record["event"], "environment.stopped")
         self.assertEqual(record["user"]["id"], "user-1")
 
+    def test_enrich_entry_uses_workflow_execution_creator_for_service_account_environment(self) -> None:
+        record = enrich_entry(
+            FakeClientWithWorkflowEnvironment(),
+            audit_entry(
+                action="Environment created",
+                actor_id="service-account-1",
+                actor_principal="PRINCIPAL_SERVICE_ACCOUNT",
+            ),
+            "environment.created",
+        )
+
+        stdout = stdout_record(record)
+
+        self.assertEqual(stdout["enrichment"]["creatorEmail"], "user@example.com")
+        self.assertEqual(stdout["enrichment"]["gitRepoUrl"], "https://github.com/acme/workflow.git")
+        self.assertEqual(
+            [detail["kind"] for detail in record["details"]],
+            ["environment", "workflowExecutionAction", "workflowExecution", "user", "runner"],
+        )
+
     def test_enrich_entry_adds_user_agent_execution_and_environments(self) -> None:
         record = enrich_entry(
             FakeClient(),
@@ -235,6 +330,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(record["agentExecution"]["id"], "agent-exec-1")
         self.assertEqual([item["id"] for item in record["environments"]], ["env-2", "env-1"])
         self.assertEqual(record["runner"]["runner_id"], "runner-1")
+
+    def test_enrich_entry_uses_workflow_execution_creator_for_service_account_agent_execution(self) -> None:
+        record = enrich_entry(
+            FakeClientWithWorkflowAgent(),
+            audit_entry(
+                subject_type="RESOURCE_TYPE_AGENT_EXECUTION",
+                subject_id="agent-exec-1",
+                action="AgentExecution created",
+                actor_id="service-account-1",
+                actor_principal="PRINCIPAL_SERVICE_ACCOUNT",
+            ),
+            "agent_execution.started",
+        )
+
+        stdout = stdout_record(record)
+
+        self.assertEqual(stdout["enrichment"]["creatorEmail"], "user@example.com")
+        self.assertEqual(stdout["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertEqual(
+            [detail["kind"] for detail in record["details"]],
+            ["agentExecution", "workflowExecutionAction", "workflowExecution", "user", "environment", "runner"],
+        )
 
     def test_enrichment_projection_only_includes_requested_enriched_fields(self) -> None:
         enriched = enrich_entry(FakeClient(), audit_entry(), "environment.created")
