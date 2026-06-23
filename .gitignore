@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+auditlog.log
+enrichment-detail.log

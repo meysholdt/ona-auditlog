@@ -1,7 +1,9 @@
 # ona-auditlog
 
-Demo Python app that polls Ona audit logs and writes every received entry
-to stdout as one compact JSON object per line.
+Demo Python app that polls Ona audit logs, writes the full raw stream to
+`auditlog.log`, writes full enrichment fetch responses to
+`enrichment-detail.log`, and writes formatted relevant audit log entries with
+their enrichment to stdout.
 
 ## Setup
 
@@ -49,6 +51,18 @@ Fetch one page and exit:
 ona-auditlog --once
 ```
 
+Write the full raw audit log stream to a different file:
+
+```bash
+ona-auditlog --log-file /tmp/auditlog.log
+```
+
+Write full enrichment fetch responses to a different file:
+
+```bash
+ona-auditlog --enrichment-detail-file /tmp/enrichment-detail.log
+```
+
 Filter audit logs by subject, actor, or creation time:
 
 ```bash
@@ -61,10 +75,39 @@ ona-auditlog \
 
 ## Output
 
-Each received SDK audit log entry is serialized to JSON and printed
-immediately. Entries already printed in the current process are suppressed on
-later polls.
+Every received SDK audit log entry is serialized to compact JSON and appended
+to `auditlog.log`. Full JSON objects fetched to enrich stdout events are
+appended as formatted JSON to `enrichment-detail.log`. Entries already seen in
+the current process are suppressed on later polls.
+
+Stdout only receives these events:
+
+- environment created or deleted
+- environment started or stopped
+- agent execution started
+
+For each matching event, stdout includes all values from the relevant audit log
+entry plus a clearly separated `enrichment` object containing:
+
+- user email
+- git repository URL
+- S3 streamstore prefix for the agent conversation, when it can be computed
 
 ```json
-{"action":"environment.start","actorId":"user-uuid","actorPrincipal":"PRINCIPAL_USER","createdAt":"2026-01-01T00:00:00Z","id":"audit-log-id","subjectId":"env-uuid","subjectType":"RESOURCE_TYPE_ENVIRONMENT"}
+{
+  "auditLog": {
+    "action": "started environment",
+    "actorId": "user-uuid",
+    "actorPrincipal": "PRINCIPAL_USER",
+    "createdAt": "2026-01-01T00:00:00Z",
+    "id": "audit-log-id",
+    "subjectId": "env-uuid",
+    "subjectType": "RESOURCE_TYPE_ENVIRONMENT"
+  },
+  "enrichment": {
+    "agentConversationS3Url": null,
+    "gitRepoUrl": "https://github.com/example/repo.git",
+    "userEmail": "user@example.com"
+  }
+}
 ```
