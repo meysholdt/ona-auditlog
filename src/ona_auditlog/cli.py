@@ -305,11 +305,49 @@ def git_repo_url(environment: dict[str, Any] | None) -> str | None:
     return None
 
 
+def environment_with_git_repo(enriched: dict[str, Any]) -> dict[str, Any] | None:
+    environment = enriched.get("environment")
+    if git_repo_url(environment):
+        return environment
+
+    for candidate in enriched.get("environments") or []:
+        if git_repo_url(candidate):
+            return candidate
+
+    return environment or next(iter(enriched.get("environments") or []), None)
+
+
 def runner_id_from_environment(environment: dict[str, Any] | None) -> str | None:
     if not environment:
         return None
     metadata = environment.get("metadata") or {}
     return metadata.get("runnerId") or metadata.get("runner_id")
+
+
+def cached_environment(
+    client: Gitpod,
+    environment_id: str | None,
+    environment_cache: dict[str, dict[str, Any] | None] | None,
+) -> tuple[dict[str, Any] | None, bool]:
+    if not environment_id:
+        return None, False
+
+    cached = None
+    if environment_cache is not None and environment_id in environment_cache:
+        cached = environment_cache[environment_id]
+        if git_repo_url(cached):
+            return cached, False
+
+    try:
+        environment = environment_enrichment(client, environment_id)
+    except Exception:
+        if cached is not None:
+            return cached, False
+        raise
+
+    if environment_cache is not None:
+        environment_cache[environment_id] = environment
+    return environment, True
 
 
 def nested_get(value: dict[str, Any] | None, *keys: str) -> Any:
@@ -521,14 +559,7 @@ def enrich_entry(
 
     if subject_type == "RESOURCE_TYPE_ENVIRONMENT":
         try:
-            fetched = False
-            if environment_cache is not None and subject_id in environment_cache:
-                environment = environment_cache[subject_id]
-            else:
-                environment = environment_enrichment(client, subject_id)
-                fetched = True
-                if environment_cache is not None:
-                    environment_cache[subject_id] = environment
+            environment, fetched = cached_environment(client, subject_id, environment_cache)
             record["environment"] = environment
             if fetched:
                 write_detail(record["details"], "environment", environment)
@@ -564,14 +595,7 @@ def enrich_entry(
         environments = []
         for environment_id in environment_ids_from_agent_execution(agent_execution):
             try:
-                fetched = False
-                if environment_cache is not None and environment_id in environment_cache:
-                    environment = environment_cache[environment_id]
-                else:
-                    environment = environment_enrichment(client, environment_id)
-                    fetched = True
-                    if environment_cache is not None:
-                        environment_cache[environment_id] = environment
+                environment, fetched = cached_environment(client, environment_id, environment_cache)
                 environments.append(environment)
                 if fetched:
                     write_detail(record["details"], "environment", environment)
@@ -589,9 +613,7 @@ def enrich_entry(
 
 def enrichment_projection(enriched: dict[str, Any]) -> dict[str, Any]:
     agent_execution = enriched.get("agentExecution")
-    environment = enriched.get("environment")
-    if not environment and enriched.get("environments"):
-        environment = enriched["environments"][0]
+    environment = environment_with_git_repo(enriched)
 
     projection = {
         "creatorEmail": (enriched.get("user") or {}).get("email"),
@@ -599,13 +621,17 @@ def enrichment_projection(enriched: dict[str, Any]) -> dict[str, Any]:
     }
     if enriched.get("event") == "agent_execution.started":
         projection["agentConversationS3Url"] = conversation_s3_url(agent_execution, enriched.get("runner"))
-    return projection
+    return {key: value for key, value in projection.items() if value is not None}
 
 
-def stdout_record(enriched: dict[str, Any]) -> dict[str, Any]:
+def stdout_record(enriched: dict[str, Any]) -> dict[str, Any] | None:
+    enrichment = enrichment_projection(enriched)
+    if "gitRepoUrl" not in enrichment:
+        return None
+
     return {
         "auditLog": enriched.get("auditLog"),
-        "enrichment": enrichment_projection(enriched),
+        "enrichment": enrichment,
     }
 
 
@@ -697,11 +723,12 @@ def cache_environment_for_entry(
         return
 
     try:
-        environment = environment_enrichment(client, environment_id)
-        environment_cache[environment_id] = environment
+        environment, fetched = cached_environment(client, environment_id, environment_cache)
+        if not fetched:
+            return
         write_detail(details, "environment", environment)
     except Exception:
-        environment_cache[environment_id] = None
+        return
 
 
 def poll_audit_logs(args: argparse.Namespace) -> None:
@@ -760,7 +787,9 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
                 for detail in enriched.pop("details"):
                     append_formatted_json(detail_log, detail)
 
-                print(formatted_json(stdout_record(enriched)), flush=True)
+                record = stdout_record(enriched)
+                if record is not None:
+                    print(formatted_json(record), flush=True)
 
         first_fetch = False
 

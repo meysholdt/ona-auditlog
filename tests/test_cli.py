@@ -205,10 +205,40 @@ class FailingEnvironments:
         raise RuntimeError(f"environment {environment_id} is gone")
 
 
+class FakeNoGitThenGitEnvironments:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def retrieve(self, *, environment_id: str):
+        self.calls += 1
+        if self.calls == 1:
+            return SimpleNamespace(
+                environment=SimpleNamespace(
+                    id=environment_id,
+                    metadata=SimpleNamespace(
+                        name="Demo Env",
+                        runner_id="runner-1",
+                        creator=SimpleNamespace(id="user-1", principal="PRINCIPAL_USER"),
+                    ),
+                    status=SimpleNamespace(
+                        phase="ENVIRONMENT_PHASE_RUNNING",
+                        content=SimpleNamespace(git=SimpleNamespace(clone_url=None)),
+                    ),
+                )
+            )
+        return FakeEnvironments().retrieve(environment_id=environment_id)
+
+
 class FakeClientWithDeletedEnvironment(FakeClient):
     def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
         super().__init__(entries, **kwargs)
         self.environments = FailingEnvironments()
+
+
+class FakeClientWithNoGitThenGitEnvironment(FakeClient):
+    def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
+        super().__init__(entries, **kwargs)
+        self.environments = FakeNoGitThenGitEnvironments()
 
 
 class FakeClientWithWorkflowEnvironment(FakeClient):
@@ -364,6 +394,48 @@ class CliTests(unittest.TestCase):
             },
         )
 
+    def test_enrichment_projection_uses_environment_with_git_repo_url(self) -> None:
+        self.assertEqual(
+            enrichment_projection(
+                {
+                    "event": "agent_execution.started",
+                    "user": {"email": "user@example.com"},
+                    "agentExecution": {"id": "agent-exec-1"},
+                    "environments": [
+                        {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
+                        {
+                            "id": "env-2",
+                            "status": {"content": {"git": {"cloneUrl": "https://github.com/acme/repo.git"}}},
+                        },
+                    ],
+                }
+            )["gitRepoUrl"],
+            "https://github.com/acme/repo.git",
+        )
+
+    def test_enrichment_projection_omits_unresolved_git_repo_url(self) -> None:
+        self.assertNotIn(
+            "gitRepoUrl",
+            enrichment_projection(
+                {
+                    "event": "environment.created",
+                    "user": {"email": "user@example.com"},
+                    "environment": {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
+                }
+            ),
+        )
+
+    def test_stdout_record_omits_entry_without_git_repo_url(self) -> None:
+        self.assertIsNone(
+            stdout_record(
+                {
+                    "auditLog": {"id": "audit-1", "subjectType": "RESOURCE_TYPE_ENVIRONMENT"},
+                    "event": "environment.created",
+                    "environment": {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
+                }
+            )
+        )
+
     def test_stdout_record_includes_audit_log_and_clear_enrichment_section(self) -> None:
         enriched = enrich_entry(FakeClient(), audit_entry(id="audit-9"), "environment.created")
 
@@ -435,6 +507,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual([line["kind"] for line in detail_lines], ["environment", "user", "runner"])
         self.assertIn("\n  ", stdout.getvalue())
         self.assertIn("\n  ", detail_content)
+
+    def test_poll_audit_logs_refreshes_cached_environment_without_git_repo_url(self) -> None:
+        entries = [audit_entry(id="audit-1", action="Environment created")]
+        args = argparse.Namespace(
+            host="app.gitpod.io",
+            base_url=None,
+            api_key=None,
+            page_size=100,
+            once=True,
+            history_minutes=60,
+            history_pages=1,
+            from_time=None,
+            to_time=None,
+            actor_id=[],
+            actor_principal=[],
+            subject_id=[],
+            subject_type=[],
+            log_file="",
+            enrichment_detail_file="",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args.log_file = f"{tmp}/auditlog.log"
+            args.enrichment_detail_file = f"{tmp}/enrichment-detail.log"
+            stdout = io.StringIO()
+            with patch(
+                "ona_auditlog.cli.Gitpod",
+                lambda **kwargs: FakeClientWithNoGitThenGitEnvironment(entries, **kwargs),
+            ):
+                with redirect_stdout(stdout):
+                    poll_audit_logs(args)
+
+            stdout_lines = parse_json_stream(stdout.getvalue())
+
+        self.assertEqual(stdout_lines[0]["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
 
     def test_poll_audit_logs_scans_startup_history_pages(self) -> None:
         page_one = [audit_entry(id="audit-2", action="created environment logs token")]
