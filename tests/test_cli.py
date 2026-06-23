@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from ona_auditlog.cli import (
     conversation_s3_url,
     poll_audit_logs,
     relevant_event_kind,
+    recent_from_time,
     stdout_record,
     to_payload,
 )
@@ -245,6 +247,7 @@ class CliTests(unittest.TestCase):
             api_key=None,
             page_size=100,
             once=True,
+            history_minutes=60,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -283,8 +286,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("\n  ", stdout.getvalue())
         self.assertIn("\n  ", detail_content)
 
-    def test_audit_log_filter_omits_empty_filters(self) -> None:
+    def test_recent_from_time_formats_utc_timestamp(self) -> None:
+        self.assertEqual(
+            recent_from_time(15, now=datetime(2026, 1, 1, 12, 30, 45, tzinfo=timezone.utc)),
+            "2026-01-01T12:15:45Z",
+        )
+
+    def test_recent_from_time_rejects_negative_history(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--history-minutes"):
+            recent_from_time(-1)
+
+    def test_audit_log_filter_defaults_to_recent_history(self) -> None:
         args = argparse.Namespace(
+            history_minutes=60,
+            from_time=None,
+            to_time=None,
+            actor_id=[],
+            actor_principal=[],
+            subject_id=[],
+            subject_type=[],
+        )
+        self.assertEqual(
+            audit_log_filter(args, now=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)),
+            {"from": "2026-01-01T11:00:00Z"},
+        )
+
+    def test_audit_log_filter_can_disable_default_history(self) -> None:
+        args = argparse.Namespace(
+            history_minutes=0,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -296,6 +325,7 @@ class CliTests(unittest.TestCase):
 
     def test_audit_log_filter_supports_sdk_filter_fields(self) -> None:
         args = argparse.Namespace(
+            history_minutes=60,
             from_time="2026-01-01T00:00:00Z",
             to_time=None,
             actor_id=["user-1"],
@@ -317,6 +347,7 @@ class CliTests(unittest.TestCase):
     def test_audit_log_list_kwargs_sets_page_size_and_descending_sort(self) -> None:
         args = argparse.Namespace(
             page_size=50,
+            history_minutes=0,
             from_time=None,
             to_time=None,
             actor_id=[],
@@ -335,6 +366,7 @@ class CliTests(unittest.TestCase):
     def test_audit_log_list_kwargs_rejects_invalid_page_size(self) -> None:
         args = argparse.Namespace(
             page_size=0,
+            history_minutes=0,
             from_time=None,
             to_time=None,
             actor_id=[],

@@ -5,6 +5,7 @@ import json
 import signal
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -14,6 +15,7 @@ from gitpod import Gitpod
 DEFAULT_HOST = "app.gitpod.io"
 DEFAULT_LOG_FILE = "auditlog.log"
 DEFAULT_ENRICHMENT_DETAIL_FILE = "enrichment-detail.log"
+DEFAULT_HISTORY_MINUTES = 60.0
 
 ENVIRONMENT_EVENTS = {
     ("RESOURCE_TYPE_ENVIRONMENT", "Environment created"): "environment.created",
@@ -82,6 +84,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--once",
         action="store_true",
         help="Fetch one page of audit log entries and exit.",
+    )
+    parser.add_argument(
+        "--history-minutes",
+        type=float,
+        default=DEFAULT_HISTORY_MINUTES,
+        help=(
+            "When --from is not set, fetch this many minutes of recent audit log history. "
+            f"Defaults to {DEFAULT_HISTORY_MINUTES:g}. Use 0 to disable."
+        ),
     )
     parser.add_argument(
         "--log-file",
@@ -443,10 +454,28 @@ def stdout_record(enriched: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def audit_log_filter(args: argparse.Namespace) -> dict[str, Any]:
+def recent_from_time(history_minutes: float, now: datetime | None = None) -> str | None:
+    if history_minutes < 0:
+        raise ValueError("--history-minutes must not be negative")
+    if history_minutes == 0:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    recent = now.astimezone(timezone.utc) - timedelta(minutes=history_minutes)
+    return recent.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def audit_log_filter(args: argparse.Namespace, now: datetime | None = None) -> dict[str, Any]:
     filters: dict[str, Any] = {}
     if args.from_time:
         filters["from"] = args.from_time
+    else:
+        from_time = recent_from_time(getattr(args, "history_minutes", DEFAULT_HISTORY_MINUTES), now=now)
+        if from_time:
+            filters["from"] = from_time
     if args.to_time:
         filters["to"] = args.to_time
     if args.actor_id:

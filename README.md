@@ -33,6 +33,15 @@ Poll audit logs from the default host, `app.gitpod.io`:
 ona-auditlog
 ```
 
+By default, the first request includes the last 60 minutes of audit log history
+so stdout and the log files have initial content. Change or disable that
+lookback with:
+
+```bash
+ona-auditlog --history-minutes 15
+ona-auditlog --history-minutes 0
+```
+
 Use a different Ona host:
 
 ```bash
@@ -72,6 +81,8 @@ ona-auditlog \
   --actor-principal PRINCIPAL_USER \
   --from 2026-01-01T00:00:00Z
 ```
+
+When `--from` is set explicitly, it overrides the default history lookback.
 
 ## Output
 
