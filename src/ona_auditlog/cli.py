@@ -5,6 +5,7 @@ import json
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,9 @@ ENVIRONMENT_ACTION_PREFIXES = (
     ("stopped environment", "environment.stopped"),
 )
 AGENT_EXECUTION_ACTION_PREFIXES = (("AgentExecution created", "agent_execution.started"),)
+
+
+# CLI setup
 
 
 def build_base_url(host: str) -> str:
@@ -152,6 +156,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# JSON helpers
+
+
 def to_payload(value: Any) -> Any:
     if value is None:
         return None
@@ -193,6 +200,9 @@ def attr(value: Any, name: str) -> Any:
     return getattr(value, name, None)
 
 
+# Audit-log selection
+
+
 def relevant_event_kind(entry: Any) -> str | None:
     subject_type = attr(entry, "subject_type")
     action = attr(entry, "action") or ""
@@ -205,6 +215,9 @@ def relevant_event_kind(entry: Any) -> str | None:
             if action.startswith(prefix):
                 return kind
     return None
+
+
+# SDK fetch helpers
 
 
 def user_enrichment(client: Gitpod, user_id: str | None) -> dict[str, Any] | None:
@@ -239,26 +252,28 @@ def runner_enrichment(client: Gitpod, runner_id: str | None) -> dict[str, Any] |
     return to_payload(response.runner)
 
 
-def workflow_execution_action_enrichment(client: Gitpod, workflow_execution_action_id: str | None) -> dict[str, Any] | None:
-    if not workflow_execution_action_id:
-        return None
-
-    response = client.automations.retrieve_execution_action(workflow_execution_action_id=workflow_execution_action_id)
-    return to_payload(response.workflow_execution_action)
-
-
-def workflow_execution_enrichment(client: Gitpod, workflow_execution_id: str | None) -> dict[str, Any] | None:
-    if not workflow_execution_id:
-        return None
-
-    response = client.automations.retrieve_execution(workflow_execution_id=workflow_execution_id)
-    return to_payload(response.workflow_execution)
-
-
 def write_detail(details: list[dict[str, Any]], kind: str, detail: dict[str, Any] | None) -> None:
     if detail is None:
         return
     details.append({"kind": kind, "object": detail})
+
+
+# Enrichment extraction
+
+
+@dataclass
+class Enrichment:
+    creator_email: str | None = None
+    git_repo_url: str | None = None
+    agent_conversation_s3_url: str | None = None
+
+    def to_payload(self) -> dict[str, str]:
+        fields = (
+            ("creatorEmail", self.creator_email),
+            ("gitRepoUrl", self.git_repo_url),
+            ("agentConversationS3Url", self.agent_conversation_s3_url),
+        )
+        return {key: value for key, value in fields if value is not None}
 
 
 def environment_ids_from_agent_execution(agent_execution: dict[str, Any] | None) -> list[str]:
@@ -421,81 +436,14 @@ def creator_user_id(resource: dict[str, Any] | None) -> str | None:
     return creator.get("id")
 
 
-def workflow_action_id(resource: dict[str, Any] | None) -> str | None:
-    if not resource:
-        return None
-
-    metadata = resource.get("metadata") or {}
-    action_id = metadata.get("workflowActionId") or metadata.get("workflow_action_id")
-    if action_id:
-        return action_id
-
-    spec = resource.get("spec") or {}
-    return spec.get("workflowActionId") or spec.get("workflow_action_id")
-
-
-def workflow_execution_id(action: dict[str, Any] | None) -> str | None:
-    if not action:
-        return None
-
-    metadata = action.get("metadata") or {}
-    return metadata.get("workflowExecutionId") or metadata.get("workflow_execution_id")
-
-
-def workflow_creator_user_id(
-    client: Gitpod,
-    resource: dict[str, Any] | None,
-    details: list[dict[str, Any]],
-    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
-    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
-) -> str | None:
-    action_id = workflow_action_id(resource)
-    if not action_id:
-        return None
-
-    if workflow_action_cache is not None and action_id in workflow_action_cache:
-        action = workflow_action_cache[action_id]
-    else:
-        try:
-            action = workflow_execution_action_enrichment(client, action_id)
-        except Exception:
-            return None
-        if workflow_action_cache is not None:
-            workflow_action_cache[action_id] = action
-        write_detail(details, "workflowExecutionAction", action)
-
-    execution_id = workflow_execution_id(action)
-    if not execution_id:
-        return None
-
-    if workflow_execution_cache is not None and execution_id in workflow_execution_cache:
-        execution = workflow_execution_cache[execution_id]
-    else:
-        try:
-            execution = workflow_execution_enrichment(client, execution_id)
-        except Exception:
-            return None
-        if workflow_execution_cache is not None:
-            workflow_execution_cache[execution_id] = execution
-        write_detail(details, "workflowExecution", execution)
-
-    return creator_user_id(execution)
-
-
 def creator_email(
     client: Gitpod,
     entry: Any,
     resource: dict[str, Any] | None,
     details: list[dict[str, Any]],
     user_cache: dict[str, dict[str, Any] | None] | None = None,
-    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
-    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
 ) -> str | None:
-    user_id = (
-        actor_user_id(entry)
-        or creator_user_id(resource)
-        or workflow_creator_user_id(client, resource, details, workflow_action_cache, workflow_execution_cache)
-    )
+    user_id = actor_user_id(entry) or creator_user_id(resource)
     if not user_id:
         return None
 
@@ -542,13 +490,11 @@ def enrich_entry(
     environment_cache: dict[str, dict[str, Any] | None] | None = None,
     user_cache: dict[str, dict[str, Any] | None] | None = None,
     runner_cache: dict[str, dict[str, Any] | None] | None = None,
-    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
-    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
-) -> tuple[dict[str, str], list[dict[str, Any]]]:
+) -> tuple[Enrichment, list[dict[str, Any]]]:
     subject_id = attr(entry, "subject_id")
     subject_type = attr(entry, "subject_type")
     details: list[dict[str, Any]] = []
-    enrichment: dict[str, str] = {}
+    enrichment = Enrichment()
     creator_resource: dict[str, Any] | None = None
     agent_execution: dict[str, Any] | None = None
     runner: dict[str, Any] | None = None
@@ -589,33 +535,31 @@ def enrich_entry(
         creator_resource,
         details,
         user_cache,
-        workflow_action_cache,
-        workflow_execution_cache,
     )
     if email:
-        enrichment["creatorEmail"] = email
+        enrichment.creator_email = email
 
     environment = environment_with_git_repo(environments)
     repo_url = git_repo_url(environment)
     if repo_url:
-        enrichment["gitRepoUrl"] = repo_url
+        enrichment.git_repo_url = repo_url
 
-    if kind == "agent_execution.started":
+    if kind.startswith("agent_execution."):
         conversation_url = conversation_s3_url(agent_execution, runner)
         if conversation_url:
-            enrichment["agentConversationS3Url"] = conversation_url
+            enrichment.agent_conversation_s3_url = conversation_url
 
     return enrichment, details
 
 
-def stdout_record(audit_log: Any, enrichment: dict[str, str]) -> dict[str, Any] | None:
-    if "gitRepoUrl" not in enrichment:
-        return None
-
+def stdout_record(audit_log: Any, enrichment: Enrichment) -> dict[str, Any]:
     return {
         "auditLog": to_payload(audit_log),
-        "enrichment": enrichment,
+        "enrichment": enrichment.to_payload(),
     }
+
+
+# Audit-log polling
 
 
 def recent_from_time(history_minutes: float, now: datetime | None = None) -> str | None:
@@ -721,8 +665,6 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
     environment_cache: dict[str, dict[str, Any] | None] = {}
     user_cache: dict[str, dict[str, Any] | None] = {}
     runner_cache: dict[str, dict[str, Any] | None] = {}
-    workflow_action_cache: dict[str, dict[str, Any] | None] = {}
-    workflow_execution_cache: dict[str, dict[str, Any] | None] = {}
     log_file = Path(args.log_file)
     enrichment_detail_file = Path(args.enrichment_detail_file)
     first_fetch = True
@@ -763,15 +705,12 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
                     environment_cache,
                     user_cache,
                     runner_cache,
-                    workflow_action_cache,
-                    workflow_execution_cache,
                 )
                 for detail in details:
                     append_formatted_json(detail_log, detail)
 
                 record = stdout_record(entry, enrichment)
-                if record is not None:
-                    print(formatted_json(record), flush=True)
+                print(formatted_json(record), flush=True)
 
         first_fetch = False
 
@@ -779,6 +718,9 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
             return
 
         time.sleep(args.interval)
+
+
+# Entrypoint
 
 
 def main(argv: list[str] | None = None) -> int:

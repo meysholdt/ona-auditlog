@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ona_auditlog.cli import (
+    Enrichment,
     audit_log_filter,
     audit_log_list_kwargs,
     build_base_url,
@@ -88,21 +89,20 @@ class FakeEnvironments:
         )
 
 
-class FakeWorkflowEnvironments:
+class FakeServiceAccountEnvironments:
     def retrieve(self, *, environment_id: str):
         return SimpleNamespace(
             environment=SimpleNamespace(
                 id=environment_id,
                 metadata=SimpleNamespace(
-                    name="Workflow Env",
+                    name="Service Account Env",
                     runner_id="runner-1",
                     creator=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
                 ),
-                spec=SimpleNamespace(workflow_action_id="workflow-action-1"),
                 status=SimpleNamespace(
                     phase="ENVIRONMENT_PHASE_RUNNING",
                     content=SimpleNamespace(
-                        git=SimpleNamespace(clone_url="https://github.com/acme/workflow.git"),
+                        git=SimpleNamespace(clone_url="https://github.com/acme/service.git"),
                     ),
                 ),
             )
@@ -128,15 +128,14 @@ class FakeAgents:
         )
 
 
-class FakeWorkflowAgents:
+class FakeServiceAccountAgents:
     def retrieve_execution(self, *, agent_execution_id: str):
         return SimpleNamespace(
             agent_execution=SimpleNamespace(
                 id=agent_execution_id,
                 metadata=SimpleNamespace(
-                    name="Workflow Agent Execution",
+                    name="Service Account Agent Execution",
                     creator=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
-                    workflow_action_id="workflow-action-1",
                 ),
                 spec=SimpleNamespace(code_context=SimpleNamespace(environment_id="env-1")),
                 status=SimpleNamespace(
@@ -162,27 +161,6 @@ class FakeRunners:
         )
 
 
-class FakeAutomations:
-    def retrieve_execution_action(self, *, workflow_execution_action_id: str):
-        return SimpleNamespace(
-            workflow_execution_action=SimpleNamespace(
-                id=workflow_execution_action_id,
-                metadata=SimpleNamespace(workflow_execution_id="workflow-execution-1"),
-            )
-        )
-
-    def retrieve_execution(self, *, workflow_execution_id: str):
-        return SimpleNamespace(
-            workflow_execution=SimpleNamespace(
-                id=workflow_execution_id,
-                metadata=SimpleNamespace(
-                    creator=SimpleNamespace(id="user-1", principal="PRINCIPAL_USER"),
-                    executor=SimpleNamespace(id="service-account-1", principal="PRINCIPAL_SERVICE_ACCOUNT"),
-                ),
-            )
-        )
-
-
 class FakeClient:
     def __init__(
         self,
@@ -196,7 +174,6 @@ class FakeClient:
         self.environments = FakeEnvironments()
         self.agents = FakeAgents()
         self.runners = FakeRunners()
-        self.automations = FakeAutomations()
 
 
 class FailingEnvironments:
@@ -240,16 +217,16 @@ class FakeClientWithNoGitThenGitEnvironment(FakeClient):
         self.environments = FakeNoGitThenGitEnvironments()
 
 
-class FakeClientWithWorkflowEnvironment(FakeClient):
+class FakeClientWithServiceAccountEnvironment(FakeClient):
     def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
         super().__init__(entries, **kwargs)
-        self.environments = FakeWorkflowEnvironments()
+        self.environments = FakeServiceAccountEnvironments()
 
 
-class FakeClientWithWorkflowAgent(FakeClient):
+class FakeClientWithServiceAccountAgent(FakeClient):
     def __init__(self, entries: list[SimpleNamespace] | None = None, **kwargs) -> None:
         super().__init__(entries, **kwargs)
-        self.agents = FakeWorkflowAgents()
+        self.agents = FakeServiceAccountAgents()
 
 
 def parse_json_stream(content: str) -> list[dict]:
@@ -298,13 +275,23 @@ class CliTests(unittest.TestCase):
             ),
             "agent_execution.started",
         )
+        self.assertIsNone(relevant_event_kind(audit_entry(action="changed update_time, status, phase")))
+        self.assertIsNone(
+            relevant_event_kind(
+                audit_entry(
+                    subject_type="RESOURCE_TYPE_AGENT_EXECUTION",
+                    subject_id="agent-exec-1",
+                    action="changed update_time, status, phase",
+                )
+            )
+        )
         self.assertIsNone(relevant_event_kind(audit_entry(action="created environment logs token")))
 
     def test_enrich_entry_returns_only_stdout_enrichment_fields_for_environment_event(self) -> None:
         enrichment, details = enrich_entry(FakeClient(), audit_entry(), "environment.created")
 
         self.assertEqual(
-            enrichment,
+            enrichment.to_payload(),
             {
                 "creatorEmail": "user@example.com",
                 "gitRepoUrl": "https://github.com/acme/example.git",
@@ -323,11 +310,11 @@ class CliTests(unittest.TestCase):
             "environment.stopped",
         )
 
-        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
+        self.assertEqual(enrichment.creator_email, "user@example.com")
 
-    def test_enrich_entry_uses_workflow_execution_creator_for_service_account_environment(self) -> None:
+    def test_enrich_entry_omits_creator_email_for_service_account_environment(self) -> None:
         enrichment, details = enrich_entry(
-            FakeClientWithWorkflowEnvironment(),
+            FakeClientWithServiceAccountEnvironment(),
             audit_entry(
                 action="Environment created",
                 actor_id="service-account-1",
@@ -336,11 +323,10 @@ class CliTests(unittest.TestCase):
             "environment.created",
         )
 
-        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
-        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/workflow.git")
+        self.assertEqual(enrichment.to_payload(), {"gitRepoUrl": "https://github.com/acme/service.git"})
         self.assertCountEqual(
             [detail["kind"] for detail in details],
-            ["environment", "workflowExecutionAction", "workflowExecution", "user", "runner"],
+            ["environment", "runner"],
         )
 
     def test_enrich_entry_returns_only_stdout_enrichment_fields_for_agent_execution(self) -> None:
@@ -354,16 +340,16 @@ class CliTests(unittest.TestCase):
             "agent_execution.started",
         )
 
-        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
-        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertEqual(enrichment.creator_email, "user@example.com")
+        self.assertEqual(enrichment.git_repo_url, "https://github.com/acme/example.git")
         self.assertCountEqual(
             [detail["kind"] for detail in details],
             ["agentExecution", "user", "environment", "runner", "environment"],
         )
 
-    def test_enrich_entry_uses_workflow_execution_creator_for_service_account_agent_execution(self) -> None:
+    def test_enrich_entry_omits_creator_email_for_service_account_agent_execution(self) -> None:
         enrichment, details = enrich_entry(
-            FakeClientWithWorkflowAgent(),
+            FakeClientWithServiceAccountAgent(),
             audit_entry(
                 subject_type="RESOURCE_TYPE_AGENT_EXECUTION",
                 subject_id="agent-exec-1",
@@ -374,15 +360,28 @@ class CliTests(unittest.TestCase):
             "agent_execution.started",
         )
 
-        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
-        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertEqual(enrichment.git_repo_url, "https://github.com/acme/example.git")
+        self.assertIsNone(enrichment.creator_email)
+        self.assertEqual(
+            enrichment.agent_conversation_s3_url,
+            "s3://agent-bucket/conversations/agent-exec-1/chunks/",
+        )
         self.assertCountEqual(
             [detail["kind"] for detail in details],
-            ["agentExecution", "workflowExecutionAction", "workflowExecution", "user", "environment", "runner"],
+            ["agentExecution", "environment", "runner"],
         )
 
-    def test_stdout_record_omits_entry_without_git_repo_url(self) -> None:
-        self.assertIsNone(stdout_record(audit_entry(), {"creatorEmail": "user@example.com"}))
+    def test_stdout_record_prints_available_enrichment_fields(self) -> None:
+        record = stdout_record(audit_entry(), Enrichment(creator_email="user@example.com"))
+
+        self.assertEqual(record["auditLog"]["id"], "audit-1")
+        self.assertEqual(record["enrichment"], {"creatorEmail": "user@example.com"})
+
+    def test_stdout_record_prints_empty_enrichment_when_nothing_resolves(self) -> None:
+        record = stdout_record(audit_entry(), Enrichment())
+
+        self.assertEqual(record["auditLog"]["id"], "audit-1")
+        self.assertEqual(record["enrichment"], {})
 
     def test_stdout_record_includes_audit_log_and_clear_enrichment_section(self) -> None:
         entry = audit_entry(id="audit-9")
@@ -408,7 +407,8 @@ class CliTests(unittest.TestCase):
     def test_poll_audit_logs_writes_all_new_entries_to_file_and_only_relevant_to_stdout(self) -> None:
         entries = [
             audit_entry(id="audit-1", action="created environment logs token"),
-            audit_entry(id="audit-2", action="Environment created"),
+            audit_entry(id="audit-2", action="changed update_time, status, phase"),
+            audit_entry(id="audit-3", action="Environment created"),
         ]
         args = argparse.Namespace(
             host="app.gitpod.io",
@@ -443,11 +443,12 @@ class CliTests(unittest.TestCase):
                 detail_lines = parse_json_stream(detail_content)
             stdout_lines = parse_json_stream(stdout.getvalue())
 
-        self.assertEqual(len(raw_lines), 2)
-        self.assertEqual(raw_lines[0]["id"], "audit-2")
-        self.assertEqual(raw_lines[1]["id"], "audit-1")
+        self.assertEqual(len(raw_lines), 3)
+        self.assertEqual(raw_lines[0]["id"], "audit-3")
+        self.assertEqual(raw_lines[1]["id"], "audit-2")
+        self.assertEqual(raw_lines[2]["id"], "audit-1")
         self.assertEqual(len(stdout_lines), 1)
-        self.assertEqual(stdout_lines[0]["auditLog"]["id"], "audit-2")
+        self.assertEqual(stdout_lines[0]["auditLog"]["id"], "audit-3")
         self.assertEqual(stdout_lines[0]["auditLog"]["action"], "Environment created")
         self.assertEqual(stdout_lines[0]["enrichment"]["creatorEmail"], "user@example.com")
         self.assertEqual(stdout_lines[0]["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
