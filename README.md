@@ -1,9 +1,7 @@
 # ona-auditlog
 
-Demo Python app that polls Ona audit logs, writes the full raw stream to
-`auditlog.log`, writes full enrichment fetch responses to
-`enrichment-detail.log`, and writes formatted relevant audit log entries with
-their enrichment to stdout.
+Demo Python app that polls Ona audit logs and prints selected entries to stdout
+with a small enrichment object.
 
 ## Setup
 
@@ -98,27 +96,29 @@ Stdout only receives these events:
 - environment started or stopped
 - agent execution started
 
-For each matching event, stdout includes all values from the relevant audit log
-entry plus a clearly separated `enrichment` object containing:
+For each matching event, stdout includes the audit log entry plus a small
+`enrichment` object. The enrichment object only includes these fields, and
+fields that cannot be resolved are omitted:
 
-- creator email
-- git repository URL
-- S3 streamstore prefix for the agent conversation, only for agent execution events
+- `creatorEmail`
+- `gitRepoUrl`
+- `agentConversationS3Url`, only for agent execution events
 
 ```json
 {
   "auditLog": {
-    "action": "started environment",
+    "action": "AgentExecution created",
     "actorId": "user-uuid",
     "actorPrincipal": "PRINCIPAL_USER",
     "createdAt": "2026-01-01T00:00:00Z",
     "id": "audit-log-id",
-    "subjectId": "env-uuid",
-    "subjectType": "RESOURCE_TYPE_ENVIRONMENT"
+    "subjectId": "agent-execution-uuid",
+    "subjectType": "RESOURCE_TYPE_AGENT_EXECUTION"
   },
   "enrichment": {
+    "agentConversationS3Url": "s3://bucket/conversations/agent-execution-uuid/chunks/",
     "creatorEmail": "user@example.com",
-    "gitRepoUrl": "https://github.com/example/repo.git"
+    "gitRepoUrl": "https://github.com/example/repo"
   }
 }
 ```

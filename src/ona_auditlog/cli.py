@@ -305,16 +305,12 @@ def git_repo_url(environment: dict[str, Any] | None) -> str | None:
     return None
 
 
-def environment_with_git_repo(enriched: dict[str, Any]) -> dict[str, Any] | None:
-    environment = enriched.get("environment")
-    if git_repo_url(environment):
-        return environment
-
-    for candidate in enriched.get("environments") or []:
+def environment_with_git_repo(environments: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    for candidate in environments:
         if git_repo_url(candidate):
             return candidate
 
-    return environment or next(iter(enriched.get("environments") or []), None)
+    return next(iter(environments), None)
 
 
 def runner_id_from_environment(environment: dict[str, Any] | None) -> str | None:
@@ -408,6 +404,12 @@ def conversation_s3_url(agent_execution: dict[str, Any] | None, runner: dict[str
     return f"s3://{bucket}/conversations/{execution_id}/chunks/"
 
 
+def actor_user_id(entry: Any) -> str | None:
+    if attr(entry, "actor_principal") == "PRINCIPAL_USER":
+        return attr(entry, "actor_id")
+    return None
+
+
 def creator_user_id(resource: dict[str, Any] | None) -> str | None:
     if not resource:
         return None
@@ -440,17 +442,13 @@ def workflow_execution_id(action: dict[str, Any] | None) -> str | None:
     return metadata.get("workflowExecutionId") or metadata.get("workflow_execution_id")
 
 
-def resolve_creator_user_id(
+def workflow_creator_user_id(
     client: Gitpod,
     resource: dict[str, Any] | None,
     details: list[dict[str, Any]],
     workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
     workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
 ) -> str | None:
-    direct_user_id = creator_user_id(resource)
-    if direct_user_id:
-        return direct_user_id
-
     action_id = workflow_action_id(resource)
     if not action_id:
         return None
@@ -484,54 +482,57 @@ def resolve_creator_user_id(
     return creator_user_id(execution)
 
 
-def set_user_if_missing(
+def creator_email(
     client: Gitpod,
-    record: dict[str, Any],
-    user_id: str | None,
+    entry: Any,
+    resource: dict[str, Any] | None,
+    details: list[dict[str, Any]],
     user_cache: dict[str, dict[str, Any] | None] | None = None,
-) -> None:
-    if record.get("user") is not None or not user_id:
-        return
+    workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
+    workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
+) -> str | None:
+    user_id = (
+        actor_user_id(entry)
+        or creator_user_id(resource)
+        or workflow_creator_user_id(client, resource, details, workflow_action_cache, workflow_execution_cache)
+    )
+    if not user_id:
+        return None
 
     try:
-        fetched = False
         if user_cache is not None and user_id in user_cache:
             user = user_cache[user_id]
         else:
             user = user_enrichment(client, user_id)
-            fetched = True
             if user_cache is not None:
                 user_cache[user_id] = user
-        record["user"] = user
-        if fetched:
-            write_detail(record["details"], "user", user)
-    except Exception as exc:
-        record["errors"].append(f"failed to fetch creator user {user_id}: {exc}")
+            write_detail(details, "user", user)
+        return (user or {}).get("email")
+    except Exception:
+        return None
 
 
-def set_runner_if_missing(
+def environment_runner(
     client: Gitpod,
-    record: dict[str, Any],
-    runner_id: str | None,
+    environment: dict[str, Any] | None,
+    details: list[dict[str, Any]],
     runner_cache: dict[str, dict[str, Any] | None] | None = None,
-) -> None:
-    if record.get("runner") is not None or not runner_id:
-        return
+) -> dict[str, Any] | None:
+    runner_id = runner_id_from_environment(environment)
+    if not runner_id:
+        return None
 
     try:
-        fetched = False
         if runner_cache is not None and runner_id in runner_cache:
-            runner = runner_cache[runner_id]
-        else:
-            runner = runner_enrichment(client, runner_id)
-            fetched = True
-            if runner_cache is not None:
-                runner_cache[runner_id] = runner
-        record["runner"] = runner
-        if fetched:
-            write_detail(record["details"], "runner", runner)
-    except Exception as exc:
-        record["errors"].append(f"failed to fetch runner {runner_id}: {exc}")
+            return runner_cache[runner_id]
+
+        runner = runner_enrichment(client, runner_id)
+        if runner_cache is not None:
+            runner_cache[runner_id] = runner
+        write_detail(details, "runner", runner)
+        return runner
+    except Exception:
+        return None
 
 
 def enrich_entry(
@@ -543,94 +544,76 @@ def enrich_entry(
     runner_cache: dict[str, dict[str, Any] | None] | None = None,
     workflow_action_cache: dict[str, dict[str, Any] | None] | None = None,
     workflow_execution_cache: dict[str, dict[str, Any] | None] | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
     subject_id = attr(entry, "subject_id")
     subject_type = attr(entry, "subject_type")
-    record: dict[str, Any] = {
-        "event": kind,
-        "auditLog": to_payload(entry),
-        "user": None,
-        "environment": None,
-        "agentExecution": None,
-        "runner": None,
-        "details": [],
-        "errors": [],
-    }
+    details: list[dict[str, Any]] = []
+    enrichment: dict[str, str] = {}
+    creator_resource: dict[str, Any] | None = None
+    agent_execution: dict[str, Any] | None = None
+    runner: dict[str, Any] | None = None
+    environments: list[dict[str, Any] | None] = []
 
     if subject_type == "RESOURCE_TYPE_ENVIRONMENT":
         try:
             environment, fetched = cached_environment(client, subject_id, environment_cache)
-            record["environment"] = environment
+            creator_resource = environment
+            environments.append(environment)
             if fetched:
-                write_detail(record["details"], "environment", environment)
-            creator_id = resolve_creator_user_id(
-                client,
-                environment,
-                record["details"],
-                workflow_action_cache,
-                workflow_execution_cache,
-            )
-            set_user_if_missing(client, record, creator_id, user_cache)
-            set_runner_if_missing(client, record, runner_id_from_environment(environment), runner_cache)
-        except Exception as exc:
-            record["errors"].append(f"failed to fetch environment {subject_id}: {exc}")
+                write_detail(details, "environment", environment)
+            runner = environment_runner(client, environment, details, runner_cache)
+        except Exception:
+            pass
 
     if subject_type == "RESOURCE_TYPE_AGENT_EXECUTION":
         try:
             agent_execution = agent_execution_enrichment(client, subject_id)
-            record["agentExecution"] = agent_execution
-            write_detail(record["details"], "agentExecution", agent_execution)
-            creator_id = resolve_creator_user_id(
-                client,
-                agent_execution,
-                record["details"],
-                workflow_action_cache,
-                workflow_execution_cache,
-            )
-            set_user_if_missing(client, record, creator_id, user_cache)
-        except Exception as exc:
+            creator_resource = agent_execution
+            write_detail(details, "agentExecution", agent_execution)
+        except Exception:
             agent_execution = None
-            record["errors"].append(f"failed to fetch agent execution {subject_id}: {exc}")
 
-        environments = []
         for environment_id in environment_ids_from_agent_execution(agent_execution):
             try:
                 environment, fetched = cached_environment(client, environment_id, environment_cache)
                 environments.append(environment)
                 if fetched:
-                    write_detail(record["details"], "environment", environment)
-                set_runner_if_missing(client, record, runner_id_from_environment(environment), runner_cache)
-            except Exception as exc:
-                record["errors"].append(f"failed to fetch agent execution environment {environment_id}: {exc}")
-        if environments:
-            record["environments"] = environments
+                    write_detail(details, "environment", environment)
+                runner = runner or environment_runner(client, environment, details, runner_cache)
+            except Exception:
+                pass
 
-    if not record["errors"]:
-        del record["errors"]
+    email = creator_email(
+        client,
+        entry,
+        creator_resource,
+        details,
+        user_cache,
+        workflow_action_cache,
+        workflow_execution_cache,
+    )
+    if email:
+        enrichment["creatorEmail"] = email
 
-    return record
+    environment = environment_with_git_repo(environments)
+    repo_url = git_repo_url(environment)
+    if repo_url:
+        enrichment["gitRepoUrl"] = repo_url
+
+    if kind == "agent_execution.started":
+        conversation_url = conversation_s3_url(agent_execution, runner)
+        if conversation_url:
+            enrichment["agentConversationS3Url"] = conversation_url
+
+    return enrichment, details
 
 
-def enrichment_projection(enriched: dict[str, Any]) -> dict[str, Any]:
-    agent_execution = enriched.get("agentExecution")
-    environment = environment_with_git_repo(enriched)
-
-    projection = {
-        "creatorEmail": (enriched.get("user") or {}).get("email"),
-        "gitRepoUrl": git_repo_url(environment),
-    }
-    if enriched.get("event") == "agent_execution.started":
-        projection["agentConversationS3Url"] = conversation_s3_url(agent_execution, enriched.get("runner"))
-    return {key: value for key, value in projection.items() if value is not None}
-
-
-def stdout_record(enriched: dict[str, Any]) -> dict[str, Any] | None:
-    enrichment = enrichment_projection(enriched)
+def stdout_record(audit_log: Any, enrichment: dict[str, str]) -> dict[str, Any] | None:
     if "gitRepoUrl" not in enrichment:
         return None
 
     return {
-        "auditLog": enriched.get("auditLog"),
+        "auditLog": to_payload(audit_log),
         "enrichment": enrichment,
     }
 
@@ -719,14 +702,13 @@ def cache_environment_for_entry(
         return
 
     environment_id = attr(entry, "subject_id")
-    if not environment_id or environment_id in environment_cache:
+    if not environment_id:
         return
 
     try:
         environment, fetched = cached_environment(client, environment_id, environment_cache)
-        if not fetched:
-            return
-        write_detail(details, "environment", environment)
+        if fetched:
+            write_detail(details, "environment", environment)
     except Exception:
         return
 
@@ -774,7 +756,7 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
                 if kind is None:
                     continue
 
-                enriched = enrich_entry(
+                enrichment, details = enrich_entry(
                     client,
                     entry,
                     kind,
@@ -784,10 +766,10 @@ def poll_audit_logs(args: argparse.Namespace) -> None:
                     workflow_action_cache,
                     workflow_execution_cache,
                 )
-                for detail in enriched.pop("details"):
+                for detail in details:
                     append_formatted_json(detail_log, detail)
 
-                record = stdout_record(enriched)
+                record = stdout_record(entry, enrichment)
                 if record is not None:
                     print(formatted_json(record), flush=True)
 

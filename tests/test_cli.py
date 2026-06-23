@@ -14,7 +14,6 @@ from ona_auditlog.cli import (
     audit_log_filter,
     audit_log_list_kwargs,
     build_base_url,
-    enrichment_projection,
     enrich_entry,
     conversation_s3_url,
     poll_audit_logs,
@@ -301,17 +300,20 @@ class CliTests(unittest.TestCase):
         )
         self.assertIsNone(relevant_event_kind(audit_entry(action="created environment logs token")))
 
-    def test_enrich_entry_adds_user_and_environment_for_environment_event(self) -> None:
-        record = enrich_entry(FakeClient(), audit_entry(), "environment.created")
+    def test_enrich_entry_returns_only_stdout_enrichment_fields_for_environment_event(self) -> None:
+        enrichment, details = enrich_entry(FakeClient(), audit_entry(), "environment.created")
 
-        self.assertEqual(record["event"], "environment.created")
-        self.assertEqual(record["user"]["email"], "user@example.com")
-        self.assertEqual(record["environment"]["id"], "env-1")
-        self.assertIsNone(record["agentExecution"])
-        self.assertEqual(record["runner"]["runner_id"], "runner-1")
+        self.assertEqual(
+            enrichment,
+            {
+                "creatorEmail": "user@example.com",
+                "gitRepoUrl": "https://github.com/acme/example.git",
+            },
+        )
+        self.assertCountEqual([detail["kind"] for detail in details], ["environment", "user", "runner"])
 
     def test_enrich_entry_uses_environment_creator_when_actor_is_not_user(self) -> None:
-        record = enrich_entry(
+        enrichment, _details = enrich_entry(
             FakeClient(),
             audit_entry(
                 action="stopped environment",
@@ -321,11 +323,10 @@ class CliTests(unittest.TestCase):
             "environment.stopped",
         )
 
-        self.assertEqual(record["event"], "environment.stopped")
-        self.assertEqual(record["user"]["id"], "user-1")
+        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
 
     def test_enrich_entry_uses_workflow_execution_creator_for_service_account_environment(self) -> None:
-        record = enrich_entry(
+        enrichment, details = enrich_entry(
             FakeClientWithWorkflowEnvironment(),
             audit_entry(
                 action="Environment created",
@@ -335,17 +336,15 @@ class CliTests(unittest.TestCase):
             "environment.created",
         )
 
-        stdout = stdout_record(record)
-
-        self.assertEqual(stdout["enrichment"]["creatorEmail"], "user@example.com")
-        self.assertEqual(stdout["enrichment"]["gitRepoUrl"], "https://github.com/acme/workflow.git")
-        self.assertEqual(
-            [detail["kind"] for detail in record["details"]],
+        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
+        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/workflow.git")
+        self.assertCountEqual(
+            [detail["kind"] for detail in details],
             ["environment", "workflowExecutionAction", "workflowExecution", "user", "runner"],
         )
 
-    def test_enrich_entry_adds_user_agent_execution_and_environments(self) -> None:
-        record = enrich_entry(
+    def test_enrich_entry_returns_only_stdout_enrichment_fields_for_agent_execution(self) -> None:
+        enrichment, details = enrich_entry(
             FakeClient(),
             audit_entry(
                 subject_type="RESOURCE_TYPE_AGENT_EXECUTION",
@@ -355,14 +354,15 @@ class CliTests(unittest.TestCase):
             "agent_execution.started",
         )
 
-        self.assertEqual(record["event"], "agent_execution.started")
-        self.assertEqual(record["user"]["id"], "user-1")
-        self.assertEqual(record["agentExecution"]["id"], "agent-exec-1")
-        self.assertEqual([item["id"] for item in record["environments"]], ["env-2", "env-1"])
-        self.assertEqual(record["runner"]["runner_id"], "runner-1")
+        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
+        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertCountEqual(
+            [detail["kind"] for detail in details],
+            ["agentExecution", "user", "environment", "runner", "environment"],
+        )
 
     def test_enrich_entry_uses_workflow_execution_creator_for_service_account_agent_execution(self) -> None:
-        record = enrich_entry(
+        enrichment, details = enrich_entry(
             FakeClientWithWorkflowAgent(),
             audit_entry(
                 subject_type="RESOURCE_TYPE_AGENT_EXECUTION",
@@ -374,72 +374,21 @@ class CliTests(unittest.TestCase):
             "agent_execution.started",
         )
 
-        stdout = stdout_record(record)
-
-        self.assertEqual(stdout["enrichment"]["creatorEmail"], "user@example.com")
-        self.assertEqual(stdout["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
-        self.assertEqual(
-            [detail["kind"] for detail in record["details"]],
+        self.assertEqual(enrichment["creatorEmail"], "user@example.com")
+        self.assertEqual(enrichment["gitRepoUrl"], "https://github.com/acme/example.git")
+        self.assertCountEqual(
+            [detail["kind"] for detail in details],
             ["agentExecution", "workflowExecutionAction", "workflowExecution", "user", "environment", "runner"],
         )
 
-    def test_enrichment_projection_only_includes_requested_enriched_fields(self) -> None:
-        enriched = enrich_entry(FakeClient(), audit_entry(), "environment.created")
-
-        self.assertEqual(
-            enrichment_projection(enriched),
-            {
-                "creatorEmail": "user@example.com",
-                "gitRepoUrl": "https://github.com/acme/example.git",
-            },
-        )
-
-    def test_enrichment_projection_uses_environment_with_git_repo_url(self) -> None:
-        self.assertEqual(
-            enrichment_projection(
-                {
-                    "event": "agent_execution.started",
-                    "user": {"email": "user@example.com"},
-                    "agentExecution": {"id": "agent-exec-1"},
-                    "environments": [
-                        {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
-                        {
-                            "id": "env-2",
-                            "status": {"content": {"git": {"cloneUrl": "https://github.com/acme/repo.git"}}},
-                        },
-                    ],
-                }
-            )["gitRepoUrl"],
-            "https://github.com/acme/repo.git",
-        )
-
-    def test_enrichment_projection_omits_unresolved_git_repo_url(self) -> None:
-        self.assertNotIn(
-            "gitRepoUrl",
-            enrichment_projection(
-                {
-                    "event": "environment.created",
-                    "user": {"email": "user@example.com"},
-                    "environment": {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
-                }
-            ),
-        )
-
     def test_stdout_record_omits_entry_without_git_repo_url(self) -> None:
-        self.assertIsNone(
-            stdout_record(
-                {
-                    "auditLog": {"id": "audit-1", "subjectType": "RESOURCE_TYPE_ENVIRONMENT"},
-                    "event": "environment.created",
-                    "environment": {"id": "env-1", "status": {"content": {"git": {"cloneUrl": None}}}},
-                }
-            )
-        )
+        self.assertIsNone(stdout_record(audit_entry(), {"creatorEmail": "user@example.com"}))
 
     def test_stdout_record_includes_audit_log_and_clear_enrichment_section(self) -> None:
-        enriched = enrich_entry(FakeClient(), audit_entry(id="audit-9"), "environment.created")
+        entry = audit_entry(id="audit-9")
+        enrichment, _details = enrich_entry(FakeClient(), entry, "environment.created")
 
-        record = stdout_record(enriched)
+        record = stdout_record(entry, enrichment)
 
         self.assertEqual(record["auditLog"]["id"], "audit-9")
         self.assertEqual(record["auditLog"]["action"], "Environment created")
@@ -504,7 +453,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdout_lines[0]["enrichment"]["gitRepoUrl"], "https://github.com/acme/example.git")
         self.assertNotIn("agentConversationS3Url", stdout_lines[0]["enrichment"])
         self.assertNotIn("event", stdout_lines[0])
-        self.assertEqual([line["kind"] for line in detail_lines], ["environment", "user", "runner"])
+        self.assertCountEqual([line["kind"] for line in detail_lines], ["environment", "user", "runner"])
         self.assertIn("\n  ", stdout.getvalue())
         self.assertIn("\n  ", detail_content)
 
@@ -591,14 +540,15 @@ class CliTests(unittest.TestCase):
             },
             "status": {"content": {"git": {"cloneUrl": "https://github.com/acme/cached.git"}}},
         }
-        enriched = enrich_entry(
+        entry = audit_entry(action="Environment deleted")
+        enrichment, _details = enrich_entry(
             FakeClientWithDeletedEnvironment(),
-            audit_entry(action="Environment deleted"),
+            entry,
             "environment.deleted",
             environment_cache={"env-1": cached_environment},
         )
 
-        record = stdout_record(enriched)
+        record = stdout_record(entry, enrichment)
 
         self.assertEqual(record["enrichment"]["creatorEmail"], "user@example.com")
         self.assertEqual(record["enrichment"]["gitRepoUrl"], "https://github.com/acme/cached.git")
