@@ -11,16 +11,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ona_auditlog.cli import (
-    Enrichment,
     audit_log_filter,
     audit_log_list_kwargs,
     build_base_url,
-    enrich_entry,
-    conversation_s3_url,
     poll_audit_logs,
     relevant_event_kind,
     recent_from_time,
     stdout_record,
+)
+from ona_auditlog.enrichment import (
+    AuditLogEnricher,
+    Enrichment,
+    conversation_s3_url,
     to_payload,
 )
 
@@ -241,6 +243,11 @@ def parse_json_stream(content: str) -> list[dict]:
         record, index = decoder.raw_decode(content, index)
         records.append(record)
     return records
+
+
+def enrich_entry(client, entry, kind, **kwargs):
+    result = AuditLogEnricher(client, **kwargs).enrich(entry, kind)
+    return result.enrichment, result.details
 
 
 class CliTests(unittest.TestCase):
